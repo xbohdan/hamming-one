@@ -8,6 +8,7 @@
 #include <thrust/pair.h>
 #include <thrust/sort.h>
 
+// check for runtime errors when calling CUDA functions
 void check(const cudaError_t cudaStatus, const char* func, const char* file, const int line) {
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "CUDA error at %s:%d code=%d(%s) \"%s\"\n", file, line, cudaStatus, cudaGetErrorString(cudaStatus), func);
@@ -17,7 +18,7 @@ void check(const cudaError_t cudaStatus, const char* func, const char* file, con
 
 #define cudaCheckErrors(val) check((val), #val, __FILE__, __LINE__);
 
-// Polynomial rolling hash
+// build a polynomial rolling hash
 __global__ void computeHashes(thrust::pair<uint_fast64_t, int>* const hashes, const char* d_data, const int N, const int L, const uint_fast64_t multiplier, const uint_fast64_t modulus)
 {
 	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -29,10 +30,12 @@ __global__ void computeHashes(thrust::pair<uint_fast64_t, int>* const hashes, co
 			a = a * multiplier % modulus;
 		}
 		thrust::pair<uint_fast64_t, int> el{ hash, tid };
+		// allow multiple entries with the same key (multimap)
 		hashes[tid] = el;
 	}
 }
 
+// return the index of the rightmost element if there are duplicates
 __device__ int binarySearch(const thrust::pair<uint_fast64_t, int>* const hashes, const uint_fast64_t newHash, const int N)
 {
 	int left = 0;
@@ -52,6 +55,7 @@ __device__ int binarySearch(const thrust::pair<uint_fast64_t, int>* const hashes
 	return -1;
 }
 
+// find pairs with the Hamming distance equal to one in O(N*L*log(N)) time
 __global__ void findHammingOne(const thrust::pair<uint_fast64_t, int>* const hashes, const char* const d_data, const int N, const int L, const uint_fast64_t multiplier, const uint_fast64_t modulus)
 {
 	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -59,6 +63,7 @@ __global__ void findHammingOne(const thrust::pair<uint_fast64_t, int>* const has
 		uint_fast64_t a = 1;
 		for (int i = 0; i < L; ++i) {
 			thrust::pair<uint_fast64_t, int> el = hashes[tid];
+			// update the hash in constant time
 			int s = d_data[el.second * L + i] == 1 ? 1 : -1;
 			uint_fast64_t newHash = (el.first + s * a + modulus) % modulus;
 			int j = binarySearch(hashes, newHash, N);
@@ -67,6 +72,7 @@ __global__ void findHammingOne(const thrust::pair<uint_fast64_t, int>* const has
 				if (newEl.first != newHash) {
 					break;
 				}
+				// print pairs only once
 				if (el.second < newEl.second) {
 					printf("(%d, %d)\n", el.second, newEl.second);
 				}
@@ -77,6 +83,7 @@ __global__ void findHammingOne(const thrust::pair<uint_fast64_t, int>* const has
 	}
 }
 
+// read data from an existing well-formatted file
 void readFile(char*& h_data, int& N, int& L, const std::string fileName)
 {
 	std::ifstream file(fileName);
@@ -95,6 +102,7 @@ void readFile(char*& h_data, int& N, int& L, const std::string fileName)
 			char b;
 			file >> b;
 			if (b == '0') {
+				// replace 0's with 2's to get good hashing
 				h_data[i * L + j] = 2;
 			}
 			else if (b == '1') {
@@ -104,12 +112,13 @@ void readFile(char*& h_data, int& N, int& L, const std::string fileName)
 	}
 }
 
+// write time measurements to a unique file
 void writeStats(const int N, const int L, const float readTime, const float memcpyTime, const float computeTime, const float sortTime, const float findTime)
 {
 	std::string now = std::to_string(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
 	std::ofstream file("stats_" + now + ".txt");
 	if (!file.is_open()) {
-		fprintf(stderr, "ofstream failed!");
+		fprintf(stderr, "ofstream failed!\n");
 		exit(1);
 	}
 	file << "Reading " << N << " binary sequences of length " << L << ": " << readTime
