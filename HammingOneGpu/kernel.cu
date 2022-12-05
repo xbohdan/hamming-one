@@ -1,58 +1,69 @@
 ﻿#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
+#include <chrono>
 #include <fstream>
+
+#include <thrust/execution_policy.h>
 #include <thrust/pair.h>
 #include <thrust/sort.h>
-#include <thrust/execution_policy.h>
 
-// Rabin-Karp rolling hash
-__global__ void computeHashes(thrust::pair<size_t, int>* const hashes, const uint_fast8_t* data, const int N, const int L, const size_t multiplier, const size_t modulus)
+void check(const cudaError_t cudaStatus, const char* func, const char* file, const int line) {
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "CUDA error at %s:%d code=%d(%s) \"%s\"\n", file, line, cudaStatus, cudaGetErrorString(cudaStatus), func);
+		exit(EXIT_FAILURE);
+	}
+}
+
+#define cudaCheckErrors(val) check((val), #val, __FILE__, __LINE__);
+
+// Polynomial rolling hash
+__global__ void computeHashes(thrust::pair<uint_fast64_t, int>* const hashes, const char* d_data, const int N, const int L, const uint_fast64_t multiplier, const uint_fast64_t modulus)
 {
 	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid < N) {
-		size_t hash = 0;
-		size_t a = multiplier;
+		uint_fast64_t hash = 0;
+		uint_fast64_t a = 1;
 		for (int i = 0; i < L; ++i) {
-			hash = (hash + a * data[tid * L + i]) % modulus;
+			hash = (hash + a * d_data[tid * L + i]) % modulus;
 			a = a * multiplier % modulus;
 		}
-		thrust::pair<size_t, int> el{ hash, tid };
+		thrust::pair<uint_fast64_t, int> el{ hash, tid };
 		hashes[tid] = el;
 	}
 }
 
-__device__ int binarySearch(const thrust::pair<size_t, int>* const hashes, const size_t hash, const int N)
+__device__ int binarySearch(const thrust::pair<uint_fast64_t, int>* const hashes, const uint_fast64_t newHash, const int N)
 {
 	int left = 0;
 	int right = N - 1;
 	while (left != right) {
 		int middle = (int)ceil(((double)left + right) / 2);
-		if (hashes[middle].first > hash) {
+		if (hashes[middle].first > newHash) {
 			right = middle - 1;
 		}
 		else {
 			left = middle;
 		}
 	}
-	if (hashes[left].first == hash) {
+	if (hashes[left].first == newHash) {
 		return left;
 	}
 	return -1;
 }
 
-__global__ void findHammingOne(const thrust::pair<size_t, int>* const hashes, const uint_fast8_t* const data, const int N, const int L, const size_t multiplier, const size_t modulus)
+__global__ void findHammingOne(const thrust::pair<uint_fast64_t, int>* const hashes, const char* const d_data, const int N, const int L, const uint_fast64_t multiplier, const uint_fast64_t modulus)
 {
 	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid < N) {
-		size_t a = multiplier;
+		uint_fast64_t a = 1;
 		for (int i = 0; i < L; ++i) {
-			thrust::pair<size_t, int> el = hashes[tid];
-			int s = data[el.second * L + i] == 1 ? 1 : -1;
-			size_t newHash = (el.first + s * a + modulus) % modulus;
+			thrust::pair<uint_fast64_t, int> el = hashes[tid];
+			int s = d_data[el.second * L + i] == 1 ? 1 : -1;
+			uint_fast64_t newHash = (el.first + s * a + modulus) % modulus;
 			int j = binarySearch(hashes, newHash, N);
 			while (j >= 0) {
-				thrust::pair<size_t, int> newEl = hashes[j];
+				thrust::pair<uint_fast64_t, int> newEl = hashes[j];
 				if (newEl.first != newHash) {
 					break;
 				}
@@ -66,94 +77,147 @@ __global__ void findHammingOne(const thrust::pair<size_t, int>* const hashes, co
 	}
 }
 
-int readFile(uint_fast8_t*& data, int& N, int& L, const char* fileName)
+void readFile(char*& h_data, int& N, int& L, const std::string fileName)
 {
 	std::ifstream file(fileName);
 	if (!file.is_open()) {
-		fprintf(stderr, "ofstream failed!");
-		return -1;
+		fprintf(stderr, "ifstream failed!\n");
+		exit(EXIT_FAILURE);
 	}
 	file >> N >> L;
-	cudaError_t cudaStatus = cudaMallocManaged((void**)&data, N * L * sizeof(*data));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMallocManaged failed!\n");
-		return -1;
+	h_data = new char[N * L];
+	if (!h_data) {
+		fprintf(stderr, "new failed!\n");
+		exit(EXIT_FAILURE);
 	}
 	for (int i = 0; i < N; ++i) {
 		for (int j = 0; j < L; ++j) {
 			char b;
 			file >> b;
 			if (b == '0') {
-				data[i * L + j] = 2;
+				h_data[i * L + j] = 2;
 			}
 			else if (b == '1') {
-				data[i * L + j] = 1;
+				h_data[i * L + j] = 1;
 			}
 		}
 	}
-	return 0;
+}
+
+void writeStats(const int N, const int L, const float readTime, const float memcpyTime, const float computeTime, const float sortTime, const float findTime)
+{
+	std::string now = std::to_string(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+	std::ofstream file("stats_" + now + ".txt");
+	if (!file.is_open()) {
+		fprintf(stderr, "ofstream failed!");
+		exit(1);
+	}
+	file << "Reading " << N << " binary sequences of length " << L << ": " << readTime
+		<< " ms\nCopying data from host to device memory: " << memcpyTime
+		<< " ms\nComputing hashes: " << computeTime
+		<< " ms\nSorting hashes: " << sortTime
+		<< " ms\nSearching for pairs with the Hamming distance equal to one: " << findTime << " ms";
 }
 
 int main()
 {
-	constexpr size_t multiplier = 16807;
-	constexpr size_t modulus = 2147483647;
+	cudaCheckErrors(cudaSetDevice(0));
+	cudaCheckErrors(cudaDeviceSetLimit(cudaLimitPrintfFifoSize, ULONG_MAX));
 
-	constexpr const char* fileName = "hamming_one.txt";
+	cudaEvent_t readStart{};
+	cudaEvent_t readEnd{};
+	cudaEvent_t memcpyStart{};
+	cudaEvent_t memcpyEnd{};
+	cudaEvent_t computeStart{};
+	cudaEvent_t computeEnd{};
+	cudaEvent_t sortStart{};
+	cudaEvent_t sortEnd{};
+	cudaEvent_t findStart{};
+	cudaEvent_t findEnd{};
+
+	cudaCheckErrors(cudaEventCreate(&readStart));
+	cudaCheckErrors(cudaEventCreate(&readEnd));
+	cudaCheckErrors(cudaEventCreate(&memcpyStart));
+	cudaCheckErrors(cudaEventCreate(&memcpyEnd));
+	cudaCheckErrors(cudaEventCreate(&computeStart));
+	cudaCheckErrors(cudaEventCreate(&computeEnd));
+	cudaCheckErrors(cudaEventCreate(&sortStart));
+	cudaCheckErrors(cudaEventCreate(&sortEnd));
+	cudaCheckErrors(cudaEventCreate(&findStart));
+	cudaCheckErrors(cudaEventCreate(&findEnd));
+
+	const std::string fileName = "hamming_one.txt";
 	int N = 0;
 	int L = 0;
+	char* h_data = nullptr;
 
-	uint_fast8_t* data = nullptr;
-	thrust::pair<size_t, int>* hashes = nullptr;
-	int numThreads = 0;
-	int numBlocks = 0;
+	cudaCheckErrors(cudaEventRecord(readStart));
+	readFile(h_data, N, L, fileName);
+	cudaCheckErrors(cudaEventRecord(readEnd));
 
-	cudaError_t cudaStatus = cudaSetDevice(0);
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?\n");
-		goto Error;
-	}
+	char* d_data = nullptr;
 
-	if (readFile(data, N, L, fileName)) {
-		goto Error;
-	}
+	cudaCheckErrors(cudaMalloc((void**)&d_data, N * L * sizeof(*d_data)));
 
-	cudaStatus = cudaMalloc((void**)&hashes, N * sizeof(*hashes));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMallocManaged failed!\n");
-		goto Error;
-	}
+	cudaCheckErrors(cudaEventRecord(memcpyStart));
+	cudaCheckErrors(cudaMemcpy(d_data, h_data, N * L * sizeof(*d_data), cudaMemcpyHostToDevice));
+	cudaCheckErrors(cudaEventRecord(memcpyEnd));
 
-	numThreads = 1024;
-	numBlocks = (int)ceil((double)N / numThreads);
+	thrust::pair<uint_fast64_t, int>* hashes = nullptr;
 
-	computeHashes << <numBlocks, numThreads >> > (hashes, data, N, L, multiplier, modulus);
+	cudaCheckErrors(cudaMalloc((void**)&hashes, N * sizeof(*hashes)));
 
-	cudaStatus = cudaGetLastError();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "computeHashes launch failed: %s\n", cudaGetErrorString(cudaStatus));
-		goto Error;
-	}
+	cudaDeviceProp prop{};
 
+	cudaCheckErrors(cudaGetDeviceProperties(&prop, 0));
+
+	int numThreads = prop.maxThreadsPerBlock;
+	int numBlocks = (int)ceil((double)N / numThreads);
+	constexpr uint_fast64_t multiplier = 16807;
+	constexpr uint_fast64_t modulus = 2147483647;
+
+	cudaCheckErrors(cudaEventRecord(computeStart));
+	computeHashes << <numBlocks, numThreads >> > (hashes, d_data, N, L, multiplier, modulus);
+	cudaCheckErrors(cudaGetLastError());
+	cudaCheckErrors(cudaEventRecord(computeEnd));
+
+	cudaCheckErrors(cudaEventRecord(sortStart));
 	thrust::sort(thrust::device, hashes, hashes + N);
+	cudaCheckErrors(cudaEventRecord(sortEnd));
 
-	findHammingOne << <numBlocks, numThreads >> > (hashes, data, N, L, multiplier, modulus);
+	cudaCheckErrors(cudaEventRecord(findStart));
+	findHammingOne << <numBlocks, numThreads >> > (hashes, d_data, N, L, multiplier, modulus);
+	cudaCheckErrors(cudaGetLastError());
+	cudaCheckErrors(cudaEventRecord(findEnd));
+	cudaCheckErrors(cudaEventSynchronize(findEnd));
 
-	cudaStatus = cudaDeviceSynchronize();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching computeHashes!\n", cudaStatus);
-		goto Error;
-	}
+	float readTime = .0f;
+	float memcpyTime = .0f;
+	float computeTime = .0f;
+	float sortTime = .0f;
+	float findTime = .0f;
 
-	cudaStatus = cudaDeviceReset();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaDeviceReset failed!\n");
-		goto Error;
-	}
+	cudaCheckErrors(cudaEventElapsedTime(&readTime, readStart, readEnd));
+	cudaCheckErrors(cudaEventElapsedTime(&memcpyTime, memcpyStart, memcpyEnd));
+	cudaCheckErrors(cudaEventElapsedTime(&computeTime, computeStart, computeEnd));
+	cudaCheckErrors(cudaEventElapsedTime(&sortTime, sortStart, sortEnd));
+	cudaCheckErrors(cudaEventElapsedTime(&findTime, findStart, findEnd));
 
-Error:
-	cudaFree(data);
-	cudaFree(hashes);
+	writeStats(N, L, readTime, memcpyTime, computeTime, sortTime, findTime);
 
-	return 0;
+	delete[] h_data;
+	cudaCheckErrors(cudaEventDestroy(readStart));
+	cudaCheckErrors(cudaEventDestroy(readEnd));
+	cudaCheckErrors(cudaEventDestroy(memcpyStart));
+	cudaCheckErrors(cudaEventDestroy(memcpyEnd));
+	cudaCheckErrors(cudaEventDestroy(computeStart));
+	cudaCheckErrors(cudaEventDestroy(computeEnd));
+	cudaCheckErrors(cudaEventDestroy(sortStart));
+	cudaCheckErrors(cudaEventDestroy(sortEnd));
+	cudaCheckErrors(cudaEventDestroy(findStart));
+	cudaCheckErrors(cudaEventDestroy(findEnd));
+	cudaCheckErrors(cudaFree(d_data));
+	cudaCheckErrors(cudaFree(hashes));
+	cudaCheckErrors(cudaDeviceReset());
+	return EXIT_SUCCESS;
 }
